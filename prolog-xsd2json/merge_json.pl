@@ -1,5 +1,6 @@
-:- encoding(utf8).
-:- module(merge_json, [ merge_json/3, merge_json/4, lookup/4 ]).
+:- module(merge_json, [ merge_json/3, merge_json/4, merge_facets/3, merge_facet/4 ]).
+:- use_module(helpers).
+
 
 /**
  * merge_json/4
@@ -21,29 +22,66 @@ merge_json(JSON1,JSON2,Merged,hard) :- merge_json(JSON1,JSON2,Merged,0).
 
 merge_json(JSON1,JSON2,_Merged,_On_Conflict) :- (var(JSON1); var(JSON2)), !, false.
 
-merge_json(json([]),json(JSON_List2),json(JSON_List2),_On_Conflict).
+merge_json(json([]),json(JSON_List2),json(JSON_List2),_On_Conflict) :- !.
+merge_json(json(JSON_List1),json([]),json(JSON_List1),_On_Conflict) :- !.
+
+merge_json(json(['$ref'=Ref]),json(JSON_List2),json(Merged),On_Conflict) :-
+  % Avoid combining "$ref" with other properties (c.f. http://json-schema.org/latest/json-schema-core.html#rfc.section.7)
+  AllOf = json([
+    allOf= [
+      json([
+        '$ref'= Ref
+      ])
+    ]
+  ]),
+  merge_json(AllOf,json(JSON_List2),json(Merged),On_Conflict).
+merge_json(json(JSON_List1),json(['$ref'=Ref]),json(Merged),On_Conflict) :-
+  % Avoid combining "$ref" with other properties (c.f. http://json-schema.org/latest/json-schema-core.html#rfc.section.7)
+  AllOf = json([
+    allOf= [
+      json([
+        '$ref'= Ref
+      ])
+    ]
+  ]),
+  merge_json(json(JSON_List1),AllOf,json(Merged),On_Conflict).
 
 merge_json(json([Key=Value|Rest_JSON_List1]),json(JSON_List2),json(Merged),On_Conflict) :-
-  % Key also exists in JSON_List2 and value is equal
-  lookup(Key,JSON_List2,Value,JSON2_Without_Key),
+  % Key also exists in JSON_List2
+  lookup(Key,JSON_List2,Value2,JSON2_Without_Key),
+  (
+      Value == Value2,
+      New_Value = Value
+    ;
+      % If `Key` is `description` simply concat the string values
+      %   by using a \n separator.
+      Key == description,
+      atomic(Value),
+      atomic(Value2),
+      string_concat(Value,'\n',ValueNl),
+      string_concat(ValueNl,Value2,New_Value)
+  ),
   merge_json(json(Rest_JSON_List1),json(JSON2_Without_Key),json(Rest_Merged),On_Conflict),
-  Merged = [Key=Value|Rest_Merged].
+  Merged = [Key=New_Value|Rest_Merged].
 
 merge_json(json([Key=Value|Rest_JSON_List1]),json(JSON_List2),json(Merged),On_Conflict) :-
   % Key also exists in JSON_List2 and value is no atom
   lookup(Key,JSON_List2,Value_in_JSON_List2,JSON2_Without_Key),
   \+atom(Value),
-  % If `Key` is `required` or `enum` use union instead of
-  %   the merge_json/3 predicate which would result
-  %   in an append of both lists.
-  % This might be necessary due to different orders to
-  %  apply the CHR rules.
   (
-      (Key == required; Key == enum), 
+      % If `Key` is `required` or `enum` use union instead of
+      %   the merge_json/3 predicate which would result
+      %   in an append of both lists.
+      % This might be necessary due to different orders to
+      %  apply the CHR rules.
+      (Key == required; Key == enum),
+      !,
       union(Value,Value_in_JSON_List2,Merged_Value)
     ;
-      Key \== required, 
-      Key \== enum,
+      Key == facets,
+      !,
+      merge_facets(Value,Value_in_JSON_List2,Merged_Value)
+    ;
       merge_json(Value,Value_in_JSON_List2,Merged_Value)
   ),
   % merge the rest of the lists independently of the
@@ -57,7 +95,7 @@ merge_json(json([Key=Value|Rest_JSON_List1]),json(JSON_List2),json(Merged),On_Co
   \+atom(Value),
   % couldn't be merged --> rename
   On_Conflict == 9,
-  New_Key = '@'Key,
+  string_concat('@',Key,New_Key),
   merge_json(json([New_Key=Value|Rest_JSON_List1]),json(JSON_List2),json(Merged),On_Conflict).
 
 merge_json(json([Key=Value|Rest_JSON_List1]),json(JSON_List2),json(Merged),On_Conflict) :-
@@ -87,32 +125,31 @@ merge_json(JSON1,JSON2,JSON) :-
 
 
 /**
- * lookup/3
- * lookup(Key,Key_Value_List,Value)
- * 
- * Predicate to search for a Key in a Key-Value-List.
- *
- * Examples:
- *   lookup(key,[key=value,key2=value2],value).
- *   lookup(key2,[key=value,key2=value2],Value2).  %% Value2 = value2.
- *   \+(lookup(key,[],Value)).
+ * merge_facets/3.
  */
-lookup(Key,Store,Value) :- 
-  lookup(Key,Store,Value,_).
+merge_facets(json([]),json(JSON_List2),json(JSON_List2)).
+merge_facets(json(JSON_List1),json([]),json(JSON_List1)) :- JSON_List1 \= [].
+merge_facets(json([Key=Value|Rest_JSON_List1]),json(JSON_List2),json(JSON)) :-
+  lookup(Key,JSON_List2,Value_in_JSON_List2,JSON2_Without_Key),
+  merge_facet(Key,Value,Value_in_JSON_List2,Merged_Value),
+  merge_facets(json(Rest_JSON_List1),json(JSON2_Without_Key),json(Rest_Merged)),
+  JSON = [Key=Merged_Value|Rest_Merged].
+merge_facets(json([Key=Value|Rest_JSON_List1]),json(JSON_List2),json(JSON)) :-
+  \+lookup(Key,JSON_List2,_Value_in_JSON_List2),
+  merge_facets(json(Rest_JSON_List1),json(JSON_List2),json(Rest_Merged)),
+  JSON = [Key=Value|Rest_Merged].
 
 
 /**
- * lookup/4
- * lookup(Key,Key_Value_List,Value,List_Without_This_Pair)
- * 
- * Search for a given Key in a Key-Value-List and return
- * the List without this pair.
- *
- * Examples:
- *   lookup(key,[key=value,key2=value2],value,[key2=value2]).
- *   lookup(key,[key=value],Value,Rest).  %% Value = value, Rest = [].
+ * merge_facet/4
+ * merge_facet(Facet,Value1,Value2,Result_Value)
  */
-lookup(Key,[Key=Value|Without_Key],Value,Without_Key).
-lookup(Key,[Not_Key=Some_Value|Rest],Value,[Not_Key=Some_Value|Without_Key]) :- 
-  Key \= Not_Key, 
-  lookup(Key,Rest,Value,Without_Key).
+merge_facet(minLength,A,B,A) :- A >= B.
+merge_facet(minLength,A,B,B) :- A < B.
+merge_facet(maxLength,A,B,A) :- A =< B.
+merge_facet(maxLength,A,B,B) :- A > B.
+merge_facet(minimum,A,B,A) :- A >= B.
+merge_facet(minimum,A,B,B) :- A < B.
+merge_facet(maximum,A,B,A) :- A =< B.
+merge_facet(maximum,A,B,B) :- A > B.
+merge_facet(pattern,A,B,R) :- string_concat(['(',A,'|',B,')'],R).
